@@ -1,0 +1,387 @@
+const slug = require("slug");
+
+const logger = require("../../config/logger");
+const { env } = require("../../config/env");
+const { fetchHtmlFromCrawler } = require("./findnovel.client");
+const {
+  parseDiscoverPage,
+  parseLatestReleasePage,
+  parseNovelInfo
+} = require("./novel.parser");
+const { parseChapterInfo } = require("./chapter.parser");
+const repository = require("./findnovel.repository");
+const { sendTelegramMessage } = require("../notify/telegram");
+
+const processedNovelIds = new Set();
+const processedNovelIds2 = new Set();
+
+function normalizeFindnovelUrl(url) {
+  if (!url || typeof url !== "string") {
+    return null;
+  }
+
+  let normalized = url
+    .trim()
+    .replace("findnovel.docsachhay.net", "findnovel.net")
+    .replace("novel5s.org", "findnovel.net");
+
+  if (!/^https?:\/\//i.test(normalized)) {
+    const prefix = normalized.startsWith("/") ? "" : "/";
+    normalized = `${env.findnovelBaseUrl}${prefix}${normalized}`;
+  }
+
+  return normalized;
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length || 1));
+
+  async function processOne() {
+    while (true) {
+      const currentIndex = cursor;
+      cursor += 1;
+
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      try {
+        const value = await worker(items[currentIndex], currentIndex);
+        results[currentIndex] = { status: "fulfilled", value };
+      } catch (error) {
+        results[currentIndex] = {
+          status: "rejected",
+          reason: error instanceof Error ? error.message : String(error)
+        };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => processOne()));
+  return results;
+}
+
+async function crawlChapterByUrl(chapterUrl) {
+  const normalizedUrl = normalizeFindnovelUrl(chapterUrl);
+  if (!normalizedUrl) {
+    throw new Error("chapterUrl is required");
+  }
+
+  const htmlContent = await fetchHtmlFromCrawler(normalizedUrl, 60000);
+  return parseChapterInfo(htmlContent, normalizedUrl);
+}
+
+async function crawlChaptersForNovel(novel, options = {}) {
+  if (!novel || !novel.novel_id) {
+    throw new Error("novel is required");
+  }
+
+  let nextChapterUrl = normalizeFindnovelUrl(options.urlStart || novel.last_chapter_url);
+  const maxChapters = Number(options.maxChapters || 0);
+  const crawlerDateBase = options.crawlerDateStart
+    ? new Date(options.crawlerDateStart)
+    : new Date();
+
+  const visitedUrls = new Set();
+  const summary = {
+    novel_id: novel.novel_id,
+    novel_name: novel.novel_name,
+    visited: 0,
+    created: 0,
+    duplicated: 0,
+    stoppedBecause: null
+  };
+
+  while (nextChapterUrl) {
+    if (visitedUrls.has(nextChapterUrl)) {
+      summary.stoppedBecause = "cycle_detected";
+      break;
+    }
+
+    visitedUrls.add(nextChapterUrl);
+    summary.visited += 1;
+
+    if (maxChapters && summary.visited > maxChapters) {
+      summary.stoppedBecause = "max_chapters_reached";
+      break;
+    }
+
+    logger.info(
+      { novel_id: novel.novel_id, chapter_url: nextChapterUrl },
+      "Crawling chapter"
+    );
+
+    const chapterInfo = await crawlChapterByUrl(nextChapterUrl);
+    if (!chapterInfo.success || !chapterInfo.chapter_name || !chapterInfo.chapter_content) {
+      summary.stoppedBecause = "invalid_chapter_content";
+      break;
+    }
+
+    const existingChapter = await repository.findChapterByNovelAndName(
+      novel.novel_id,
+      chapterInfo.chapter_name
+    );
+
+    if (!existingChapter) {
+      if (nextChapterUrl === normalizeFindnovelUrl(novel.first_chapter_url)) {
+        await repository.updateNovelFirstChapter(novel.novel_id, chapterInfo.chapter_name);
+      }
+
+      const crawlerDate = new Date(crawlerDateBase.getTime() + summary.visited * 3);
+
+      try {
+        const chapterDoc = await repository.createChapter({
+          chapterName: chapterInfo.chapter_name,
+          chapterContent: chapterInfo.chapter_content,
+          chapterUrl: nextChapterUrl,
+          crawlerDate,
+          novelId: novel.novel_id,
+          novelName: novel.novel_name
+        });
+
+        await repository.updateNovelRecentChapter(novel.novel_id, chapterDoc);
+        summary.created += 1;
+      } catch (error) {
+        if (error && error.code === 11000) {
+          summary.duplicated += 1;
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      summary.duplicated += 1;
+    }
+
+    if (!options.urlStart) {
+      await repository.updateNovelLastChapterUrl(novel.novel_id, nextChapterUrl);
+    }
+
+    nextChapterUrl = normalizeFindnovelUrl(chapterInfo.next_chapter_url);
+  }
+
+  if (summary.created > 0) {
+    await sendTelegramMessage(
+      `[FindNovel] ${summary.novel_name} (${summary.novel_id}) +${summary.created} chapter(s)`
+    );
+  }
+
+  return summary;
+}
+
+async function crawlNovelByUrl(novelUrl, options = {}) {
+  const normalizedNovelUrl = normalizeFindnovelUrl(novelUrl);
+  if (!normalizedNovelUrl) {
+    throw new Error("novelUrl is required");
+  }
+
+  const htmlContent = await fetchHtmlFromCrawler(normalizedNovelUrl, 20000);
+  const parsedNovel = parseNovelInfo(htmlContent);
+  if (!parsedNovel) {
+    throw new Error(`Cannot parse novel details from ${normalizedNovelUrl}`);
+  }
+
+  let novelInDb = await repository.findNovelByIdentity({
+    novelName: parsedNovel.novel_name,
+    novelId: parsedNovel.novel_id
+  });
+  let created = false;
+
+  if (!novelInDb) {
+    try {
+      await repository.createNovel(parsedNovel);
+      created = true;
+    } catch (error) {
+      if (!(error && error.code === 11000)) {
+        throw error;
+      }
+    }
+
+    novelInDb = await repository.getNovelById(parsedNovel.novel_id);
+  }
+
+  if (!novelInDb) {
+    throw new Error(`Cannot load novel ${parsedNovel.novel_id} after crawl`);
+  }
+
+  let chapterSummary = null;
+  if (options.crawlChapters !== false && novelInDb.last_chapter_url) {
+    chapterSummary = await crawlChaptersForNovel(novelInDb, {
+      urlStart: options.urlStart || null,
+      maxChapters: options.maxChapters || 0,
+      crawlerDateStart: options.crawlerDateStart || null
+    });
+  }
+
+  return {
+    created,
+    novel: {
+      novel_id: novelInDb.novel_id,
+      novel_name: novelInDb.novel_name
+    },
+    chapterSummary
+  };
+}
+
+async function getLatestReleaseNovels(start = 1, end = 25) {
+  const results = [];
+
+  for (let page = start; page < end; page += 1) {
+    const pageUrl = `${env.findnovelBaseUrl}/latest-release-novels?page=${page}`;
+    logger.info({ page, pageUrl }, "Fetching latest-release page");
+
+    const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
+    const pageItems = parseLatestReleasePage(htmlContent);
+    results.push(...pageItems);
+  }
+
+  return results;
+}
+
+async function syncLatestRelease(options = {}) {
+  const start = Number(options.start || env.schedulerLatestReleaseStart);
+  const end = Number(options.end || env.schedulerLatestReleaseEnd);
+  const concurrency = Number(options.concurrency || env.crawlConcurrencyCheck);
+
+  const latestNovels = await getLatestReleaseNovels(start, end);
+  const tasks = await runWithConcurrency(latestNovels, concurrency, async (novelVictim) => {
+    if (processedNovelIds2.has(novelVictim.novel_id)) {
+      return {
+        type: "skip",
+        novel_id: novelVictim.novel_id,
+        reason: "duplicate_processing"
+      };
+    }
+
+    processedNovelIds2.add(novelVictim.novel_id);
+    try {
+    const novelInfoDb = await repository.findNovelByIdentity({
+      novelName: novelVictim.novel_name,
+      novelId: novelVictim.novel_id
+    });
+
+    if (!novelInfoDb) {
+      const crawlResult = await crawlNovelByUrl(novelVictim.novel_url, {
+        crawlChapters: true
+      });
+      return {
+        type: "create_novel",
+        novel_id: crawlResult.novel.novel_id,
+        created: crawlResult.created
+      };
+    }
+
+    const latestChapter = await repository.findChapterByNovelAndName(
+      novelInfoDb.novel_id,
+      novelVictim.chapter_name
+    );
+
+    if (!latestChapter || latestChapter.premium_content) {
+      const chapterSummary = await crawlChaptersForNovel(novelInfoDb);
+      return {
+        type: "sync_chapter",
+        novel_id: novelInfoDb.novel_id,
+        chapterSummary
+      };
+    }
+
+    return {
+      type: "skip",
+      novel_id: novelInfoDb.novel_id,
+      reason: "latest_chapter_exists"
+    };
+    } finally {
+      processedNovelIds2.delete(novelVictim.novel_id);
+    }
+  });
+
+  return {
+    total: latestNovels.length,
+    tasks
+  };
+}
+
+async function discoverNewNovels(options = {}) {
+  const start = Number(options.start || env.schedulerDiscoverNewStart);
+  const end = Number(options.end || env.schedulerDiscoverNewEnd);
+  const concurrency = Number(options.concurrency || env.crawlConcurrencyNovel);
+
+  const novelUrls = [];
+  for (let page = start; page < end; page += 1) {
+    const pageUrl = `${env.findnovelBaseUrl}/genre-all/sort-new/status-all/all-novel?page=${page}`;
+    logger.info({ page, pageUrl }, "Fetching discover-new page");
+
+    const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
+    novelUrls.push(...parseDiscoverPage(htmlContent));
+  }
+
+  const uniqueUrls = [...new Set(novelUrls.map((url) => normalizeFindnovelUrl(url)).filter(Boolean))];
+  const tasks = await runWithConcurrency(uniqueUrls, concurrency, async (novelUrl) =>
+    crawlNovelByUrl(novelUrl, {
+      crawlChapters: options.crawlChapters !== false
+    })
+  );
+
+  return {
+    total: uniqueUrls.length,
+    tasks
+  };
+}
+
+async function syncExistingNovels(options = {}) {
+  const novels = await repository.findNovelsForSync({
+    novelIds: options.novelIds || [],
+    limit: Number(options.limit || env.schedulerSyncExistingLimit)
+  });
+
+  const concurrency = Number(options.concurrency || env.crawlConcurrencyChapter);
+  const tasks = await runWithConcurrency(novels, concurrency, async (novel) => {
+    if (processedNovelIds.has(novel.novel_id)) {
+      return {
+        novel_id: novel.novel_id,
+        novel_name: novel.novel_name,
+        skipped: true,
+        reason: "duplicate_processing"
+      };
+    }
+
+    processedNovelIds.add(novel.novel_id);
+    try {
+      return await crawlChaptersForNovel(novel);
+    } finally {
+      processedNovelIds.delete(novel.novel_id);
+    }
+  });
+
+  return {
+    total: novels.length,
+    tasks
+  };
+}
+
+async function crawlNovelChaptersById(novelId, options = {}) {
+  const normalizedNovelId = slug(String(novelId || "").trim());
+  if (!normalizedNovelId) {
+    throw new Error("novelId is required");
+  }
+
+  const novel = await repository.getNovelById(normalizedNovelId);
+  if (!novel) {
+    throw new Error(`Novel not found: ${normalizedNovelId}`);
+  }
+
+  return crawlChaptersForNovel(novel, options);
+}
+
+module.exports = {
+  crawlChapterByUrl,
+  crawlChaptersForNovel,
+  crawlNovelByUrl,
+  crawlNovelChaptersById,
+  discoverNewNovels,
+  getLatestReleaseNovels,
+  normalizeFindnovelUrl,
+  syncExistingNovels,
+  syncLatestRelease
+};
