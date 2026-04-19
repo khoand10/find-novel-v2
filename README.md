@@ -57,7 +57,3 @@ npm run dev
 - `TELEGRAM_ENABLED=false`
 - `TELEGRAM_BOT_TOKEN=`
 - `TELEGRAM_CHAT_ID=`
-
-## Refactor Plan
-
-- See `docs/findnovel-refactor-plan.md`.
