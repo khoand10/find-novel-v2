@@ -100,14 +100,6 @@ const NovelSchema = new Schema({
         type: String,
         trim: true
     },
-    last_chapter_url: {
-        type: String,
-        trim: true
-    },
-    first_chapter_url: {
-        type: String,
-        trim: true
-    },
     novel_victim_banner: {
         type: String,
         trim: true

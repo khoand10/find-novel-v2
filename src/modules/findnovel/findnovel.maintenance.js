@@ -1,6 +1,7 @@
 const Chapter = require("../../models/chapterModel");
 const Novel = require("../../models/novelModel");
 const NovelView = require("../../models/novelViewModel");
+const repository = require("./findnovel.repository");
 
 async function updateHotNew() {
   await Novel.updateMany({}, { hot: false, new: false });
@@ -121,46 +122,43 @@ async function updateLatestChapterForNovel(novelId) {
     }
   };
 
-  if (recentChapter.chapter_url) {
-    updatePayload.last_chapter_url = recentChapter.chapter_url;
-  }
-
   await Novel.updateOne({ novel_id: novelId }, updatePayload);
+
+  await repository.touchNovelCrawlStateSync(novelId, {
+    lastSyncedAt: new Date(),
+    crawlerDate: new Date(),
+    lastChapterUrl: recentChapter.chapter_url || undefined
+  });
+
   return { updated: true };
 }
 
 async function fixRecentChapters({ windowMinutes = 30, limit = 200 } = {}) {
   const fromTime = new Date(Date.now() - Number(windowMinutes) * 60 * 1000);
 
-  const novels = await Novel.find(
-    {
-      last_chapter_url: /findnovel|book/i,
-      crawler_date: { $gte: fromTime }
-    },
-    { novel_id: 1, _id: 0 }
-  )
-    .sort({ crawler_date: -1 })
-    .limit(Number(limit))
-    .lean();
+  const crawlStates = await repository.findCrawlStatesForFix({
+    fromTime,
+    limit
+  });
 
   let deletedChapters = 0;
   let updatedNovels = 0;
 
-  for (const novel of novels) {
+  for (const crawlState of crawlStates) {
     const deleteResult = await Chapter.deleteMany({
-      "novel.novel_id": novel.novel_id,
+      "novel.novel_id": crawlState.novel_id,
       crawler_date: { $gte: fromTime }
     });
     deletedChapters += deleteResult.deletedCount || 0;
 
-    const updateResult = await updateLatestChapterForNovel(novel.novel_id);
+    const updateResult = await updateLatestChapterForNovel(crawlState.novel_id);
     if (updateResult.updated) {
       updatedNovels += 1;
     }
   }
 
   return {
-    checkedNovels: novels.length,
+    checkedNovels: crawlStates.length,
     deletedChapters,
     updatedNovels,
     windowMinutes: Number(windowMinutes)

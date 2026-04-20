@@ -38,8 +38,7 @@ function parseNovelInfo(htmlContent) {
     voteCountType2: 1,
     novel_genres: novelGenres,
     isPanda: false,
-    first_chapter_url: lastChapterUrl,
-    last_chapter_url: lastChapterUrl,
+    initial_chapter_url: lastChapterUrl,
     novel_id: slug(novelName)
   };
 }

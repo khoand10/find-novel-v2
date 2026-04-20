@@ -79,7 +79,13 @@ async function crawlChaptersForNovel(novel, options = {}) {
     throw new Error("novel is required");
   }
 
-  let nextChapterUrl = normalizeFindnovelUrl(options.urlStart || novel.last_chapter_url);
+  const crawlState = novel.crawl_state || null;
+  let nextChapterUrl = normalizeFindnovelUrl(
+    options.urlStart || (crawlState ? crawlState.last_chapter_url : null)
+  );
+  const firstChapterUrl = normalizeFindnovelUrl(
+    crawlState ? crawlState.first_chapter_url : null
+  );
   const maxChapters = Number(options.maxChapters || 0);
   const crawlerDateBase = options.crawlerDateStart
     ? new Date(options.crawlerDateStart)
@@ -94,6 +100,13 @@ async function crawlChaptersForNovel(novel, options = {}) {
     duplicated: 0,
     stoppedBecause: null
   };
+
+  if (!nextChapterUrl) {
+    summary.stoppedBecause = "missing_last_chapter_url";
+    return summary;
+  }
+
+  let lastVisitedChapterUrl = null;
 
   while (nextChapterUrl) {
     if (visitedUrls.has(nextChapterUrl)) {
@@ -126,40 +139,45 @@ async function crawlChaptersForNovel(novel, options = {}) {
     );
 
     if (!existingChapter) {
-      if (nextChapterUrl === normalizeFindnovelUrl(novel.first_chapter_url)) {
+      if (firstChapterUrl && nextChapterUrl === firstChapterUrl) {
         await repository.updateNovelFirstChapter(novel.novel_id, chapterInfo.chapter_name);
       }
 
       const crawlerDate = new Date(crawlerDateBase.getTime() + summary.visited * 3);
 
-      try {
-        const chapterDoc = await repository.createChapter({
-          chapterName: chapterInfo.chapter_name,
-          chapterContent: chapterInfo.chapter_content,
-          chapterUrl: nextChapterUrl,
-          crawlerDate,
-          novelId: novel.novel_id,
-          novelName: novel.novel_name
-        });
+      const chapterResult = await repository.createChapterSafe({
+        chapterName: chapterInfo.chapter_name,
+        chapterContent: chapterInfo.chapter_content,
+        chapterUrl: nextChapterUrl,
+        crawlerDate,
+        novelId: novel.novel_id,
+        novelName: novel.novel_name
+      });
 
-        await repository.updateNovelRecentChapter(novel.novel_id, chapterDoc);
+      if (chapterResult.created && chapterResult.doc) {
+        await repository.updateNovelRecentChapter(novel.novel_id, chapterResult.doc);
         summary.created += 1;
-      } catch (error) {
-        if (error && error.code === 11000) {
-          summary.duplicated += 1;
-        } else {
-          throw error;
-        }
+      } else {
+        summary.duplicated += 1;
       }
     } else {
       summary.duplicated += 1;
     }
 
     if (!options.urlStart) {
-      await repository.updateNovelLastChapterUrl(novel.novel_id, nextChapterUrl);
+      await repository.updateCrawlStateLastChapterUrl(novel.novel_id, nextChapterUrl);
     }
 
+    lastVisitedChapterUrl = nextChapterUrl;
     nextChapterUrl = normalizeFindnovelUrl(chapterInfo.next_chapter_url);
+  }
+
+  if (summary.visited > 0) {
+    await repository.touchNovelCrawlStateSync(novel.novel_id, {
+      lastSyncedAt: new Date(),
+      crawlerDate: new Date(),
+      lastChapterUrl: options.urlStart ? undefined : lastVisitedChapterUrl
+    });
   }
 
   if (summary.created > 0) {
@@ -182,32 +200,54 @@ async function crawlNovelByUrl(novelUrl, options = {}) {
   if (!parsedNovel) {
     throw new Error(`Cannot parse novel details from ${normalizedNovelUrl}`);
   }
+  const { initial_chapter_url: initialChapterUrl, ...novelPayload } = parsedNovel;
 
-  let novelInDb = await repository.findNovelByIdentity({
-    novelName: parsedNovel.novel_name,
-    novelId: parsedNovel.novel_id
+  const novelInDbByIdentity = await repository.findNovelByIdentity({
+    novelName: novelPayload.novel_name,
+    novelId: novelPayload.novel_id
   });
+  let novelInDb = novelInDbByIdentity;
   let created = false;
 
-  if (!novelInDb) {
+  if (!novelInDbByIdentity) {
     try {
-      await repository.createNovel(parsedNovel);
-      created = true;
+      const upsertResult = await repository.upsertNovel(novelPayload);
+      novelInDb = upsertResult.novel;
+      created = upsertResult.created;
     } catch (error) {
       if (!(error && error.code === 11000)) {
         throw error;
       }
-    }
 
-    novelInDb = await repository.getNovelById(parsedNovel.novel_id);
+      novelInDb = await repository.findNovelByIdentity({
+        novelName: novelPayload.novel_name,
+        novelId: novelPayload.novel_id
+      });
+    }
   }
 
   if (!novelInDb) {
-    throw new Error(`Cannot load novel ${parsedNovel.novel_id} after crawl`);
+    throw new Error(`Cannot load novel ${novelPayload.novel_id} after crawl`);
   }
 
+  await repository.upsertNovelCrawlState({
+    novelId: novelInDb.novel_id,
+    source: "findnovel",
+    firstChapterUrl: initialChapterUrl,
+    lastChapterUrl: initialChapterUrl,
+    sourceNovelUrl: normalizedNovelUrl,
+    crawlerDate: new Date()
+  });
+
+  novelInDb = await repository.getNovelById(novelInDb.novel_id);
+
   let chapterSummary = null;
-  if (options.crawlChapters !== false && novelInDb.last_chapter_url) {
+  if (
+    options.crawlChapters !== false &&
+    novelInDb &&
+    novelInDb.crawl_state &&
+    novelInDb.crawl_state.last_chapter_url
+  ) {
     chapterSummary = await crawlChaptersForNovel(novelInDb, {
       urlStart: options.urlStart || null,
       maxChapters: options.maxChapters || 0,
