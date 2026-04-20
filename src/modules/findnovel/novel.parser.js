@@ -1,5 +1,6 @@
 const cheerio = require("cheerio");
-const slug = require("slug");
+const slugModule = require("slug");
+const slug = slugModule.default || slugModule;
 
 function parseNovelInfo(htmlContent) {
   const $ = cheerio.load(htmlContent);

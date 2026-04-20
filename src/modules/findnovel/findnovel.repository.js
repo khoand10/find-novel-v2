@@ -1,4 +1,5 @@
-const slug = require("slug");
+const slugModule = require("slug");
+const slug = slugModule.default || slugModule;
 
 const Novel = require("../../models/novelModel");
 const Chapter = require("../../models/chapterModel");

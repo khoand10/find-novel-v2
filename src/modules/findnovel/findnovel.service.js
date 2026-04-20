@@ -1,4 +1,5 @@
-const slug = require("slug");
+const slugModule = require("slug");
+const slug = slugModule.default || slugModule;
 
 const logger = require("../../config/logger");
 const { env } = require("../../config/env");
