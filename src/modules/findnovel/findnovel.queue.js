@@ -28,6 +28,7 @@ const novelQueue = new InternalQueue({
     notifyQueueFailure("findnovel.novel", job, error),
   processor: async (payload) =>
     findnovelService.crawlNovelByUrl(payload.novelUrl, {
+      rejectIfExists: payload.rejectIfExists,
       crawlChapters: payload.crawlChapters,
       urlStart: payload.urlStart,
       maxChapters: payload.maxChapters

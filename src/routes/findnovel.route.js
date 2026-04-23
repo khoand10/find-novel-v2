@@ -1,9 +1,25 @@
 const { Router } = require("express");
+const slugModule = require("slug");
+const slug = slugModule.default || slugModule;
 
 const findnovelQueue = require("../modules/findnovel/findnovel.queue");
-const findnovelService = require("../modules/findnovel/findnovel.service");
+const findnovelRepository = require("../modules/findnovel/findnovel.repository");
 
 const findnovelRouter = Router();
+
+function extractNovelIdFromUrl(novelUrl) {
+  try {
+    const parsedUrl = new URL(String(novelUrl || "").trim());
+    const match = parsedUrl.pathname.match(/\/book\/([^/]+)/i);
+    if (!match || !match[1]) {
+      return null;
+    }
+
+    return slug(match[1]);
+  } catch (_error) {
+    return null;
+  }
+}
 
 // API duy nhất cho nghiệp vụ hiện tại:
 // gửi link truyện -> crawl novel info + crawl chapter (mặc định)
@@ -15,23 +31,36 @@ findnovelRouter.post("/findnovel/novel-by-url", async (req, res) => {
       return res.status(400).json({ message: "novelUrl is required" });
     }
 
-    const result = await findnovelService.crawlNovelByUrl(novelUrl, {
+    const novelId = extractNovelIdFromUrl(novelUrl);
+    if (novelId) {
+      const existingNovel = await findnovelRepository.findNovelByIdentity({
+        novelId
+      });
+
+      if (existingNovel) {
+        return res.status(409).json({
+          message: `Novel already exists: ${
+            existingNovel.novel_name || existingNovel.novel_id
+          }`
+        });
+      }
+    }
+
+    const enqueueResult = await findnovelQueue.enqueueNovelByUrl({
+      novelUrl,
       rejectIfExists: true,
       crawlChapters,
       urlStart,
       maxChapters
     });
 
-    return res.status(200).json(result);
+    return res.status(202).json({
+      ...enqueueResult,
+      novelUrl
+    });
   } catch (error) {
-    if (error && error.code === "NOVEL_ALREADY_EXISTS") {
-      return res.status(error.statusCode || 409).json({
-        message: error.message
-      });
-    }
-
     return res.status(500).json({
-      message: "Failed to crawl novel by url",
+      message: "Failed to trigger crawl novel by url",
       error: error instanceof Error ? error.message : String(error)
     });
   }

@@ -47,6 +47,9 @@ async function upsertBySlug({
         }
 
         doc = await model.findOne(filter);
+        if (!doc) {
+          throw error;
+        }
       }
     }
   } else if (updateOnMatch) {

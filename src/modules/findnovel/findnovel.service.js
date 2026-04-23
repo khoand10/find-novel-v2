@@ -294,6 +294,15 @@ async function crawlNovelByUrl(novelUrl, options = {}) {
         novelName: novelPayload.novel_name,
         novelId: novelPayload.novel_id
       });
+
+      if (!novelInDb) {
+        const duplicateError = new Error(
+          `Novel conflicts with existing unique data but cannot be resolved by identity: ${novelPayload.novel_id}`
+        );
+        duplicateError.code = "NOVEL_CONFLICT_UNRESOLVED";
+        duplicateError.statusCode = 409;
+        throw duplicateError;
+      }
     }
   }
 
