@@ -8,8 +8,8 @@ const findnovelConfig = {
   },
   crawl: {
     concurrencyNovel: 3,
-    concurrencyChapter: 8,
-    concurrencyCheck: 20
+    concurrencyChapter: 6,
+    concurrencyCheck: 6
   },
   scheduler: {
     runOnStartup: true,
