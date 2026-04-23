@@ -15,30 +15,49 @@ async function upsertBySlug({
   }
 
   const filter = { [slugField]: slugValue };
-  const existingDoc = await model.findOne(filter);
-  const updateDoc = updateOnMatch
-    ? {
-        $set: payload,
-        $setOnInsert: { [slugField]: slugValue }
-      }
-    : {
-        $setOnInsert: {
-          ...payload,
-          [slugField]: slugValue
-        }
-      };
-
-  let doc = await model.findOneAndUpdate(filter, updateDoc, {
-    upsert: true,
-    new: true,
-    setDefaultsOnInsert: true
-  });
+  let doc = await model.findOne(filter);
+  let created = false;
 
   if (!doc) {
-    doc = await model.findOne(filter);
-  }
+    if (updateOnMatch) {
+      doc = await model.findOneAndUpdate(
+        filter,
+        {
+          $set: payload,
+          $setOnInsert: { [slugField]: slugValue }
+        },
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
+        }
+      );
 
-  const created = !existingDoc;
+      created = true;
+    } else {
+      try {
+        doc = await model.create({
+          ...payload,
+          [slugField]: slugValue
+        });
+        created = true;
+      } catch (error) {
+        if (!(error && error.code === 11000)) {
+          throw error;
+        }
+
+        doc = await model.findOne(filter);
+      }
+    }
+  } else if (updateOnMatch) {
+    doc = await model.findOneAndUpdate(
+      filter,
+      { $set: payload },
+      {
+        new: true
+      }
+    );
+  }
 
   let output = doc;
   if (doc && lean && typeof doc.toObject === "function") {
