@@ -8,7 +8,11 @@ module.exports = {
       watch: false,
       env: {
         NODE_ENV: 'production'
-      }
+      },
+      out_file: "./logs/findnovel-out.log",
+      error_file: "./logs/findnovel-error.log",
+      merge_logs: true,
+      time: true
     }
   ]
 };
