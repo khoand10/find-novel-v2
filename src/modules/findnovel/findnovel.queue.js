@@ -2,6 +2,7 @@ const slugModule = require("slug");
 const slug = slugModule.default || slugModule;
 
 const { env } = require("../../config/env");
+const { findnovelConfig } = require("../../config/findnovel");
 const logger = require("../../config/logger");
 const InternalQueue = require("../queue/internal-queue");
 const findnovelService = require("./findnovel.service");
@@ -21,7 +22,7 @@ async function notifyQueueFailure(queueName, job, error) {
 
 const novelQueue = new InternalQueue({
   name: "findnovel.novel",
-  concurrency: env.crawlConcurrencyNovel,
+  concurrency: findnovelConfig.crawl.concurrencyNovel,
   logger,
   onFailure: async (job, error) =>
     notifyQueueFailure("findnovel.novel", job, error),
@@ -35,7 +36,7 @@ const novelQueue = new InternalQueue({
 
 const chapterQueue = new InternalQueue({
   name: "findnovel.chapter",
-  concurrency: env.crawlConcurrencyChapter,
+  concurrency: findnovelConfig.crawl.concurrencyChapter,
   logger,
   onSuccess: async (_job, result) => {
     if (result && result.created > 0) {
@@ -132,6 +133,15 @@ const schedulerQueue = new InternalQueue({
       });
     }
 
+    if (payload.jobType === "suspected-audit") {
+      return maintenanceService.auditSuspectedChapters({
+        topLimit: payload.topLimit,
+        minDelta: payload.minDelta,
+        minRatio: payload.minRatio,
+        concurrency: payload.concurrency
+      });
+    }
+
     throw new Error(`Unsupported scheduler jobType: ${payload.jobType}`);
   }
 });
@@ -147,14 +157,17 @@ function enqueueChaptersByNovelId(payload) {
 }
 
 function enqueueLatestRelease(payload = {}) {
+  const start = payload.start || findnovelConfig.scheduler.latestReleaseStart;
+  const end = payload.end || findnovelConfig.scheduler.latestReleaseEnd;
+
   return schedulerQueue.enqueue(
     {
       jobType: "latest-release",
-      start: payload.start || env.schedulerLatestReleaseStart,
-      end: payload.end || env.schedulerLatestReleaseEnd,
-      concurrency: payload.concurrency || env.crawlConcurrencyCheck
+      start,
+      end,
+      concurrency: payload.concurrency || findnovelConfig.crawl.concurrencyCheck
     },
-    { key: "scheduler:latest-release" }
+    { key: `scheduler:latest-release:${start}:${end}` }
   );
 }
 
@@ -163,8 +176,8 @@ function enqueueSyncExisting(payload = {}) {
     {
       jobType: "sync-existing",
       novelIds: payload.novelIds || [],
-      limit: payload.limit || env.schedulerSyncExistingLimit,
-      concurrency: payload.concurrency || env.crawlConcurrencyChapter
+      limit: payload.limit || findnovelConfig.scheduler.syncExistingLimit,
+      concurrency: payload.concurrency || findnovelConfig.crawl.concurrencyChapter
     },
     { key: "scheduler:sync-existing" }
   );
@@ -174,13 +187,13 @@ function enqueueDiscoverNew(payload = {}) {
   return schedulerQueue.enqueue(
     {
       jobType: "discover-new",
-      start: payload.start || env.schedulerDiscoverNewStart,
-      end: payload.end || env.schedulerDiscoverNewEnd,
+      start: payload.start || findnovelConfig.scheduler.discoverNewStart,
+      end: payload.end || findnovelConfig.scheduler.discoverNewEnd,
       crawlChapters:
         payload.crawlChapters === undefined
-          ? env.schedulerDiscoverCrawlChapters
+          ? findnovelConfig.scheduler.discoverCrawlChapters
           : payload.crawlChapters,
-      concurrency: payload.concurrency || env.crawlConcurrencyNovel
+      concurrency: payload.concurrency || findnovelConfig.crawl.concurrencyNovel
     },
     { key: "scheduler:discover-new" }
   );
@@ -191,24 +204,29 @@ function enqueueMainSync(payload = {}) {
     {
       jobType: "main-sync",
       novelIds: payload.novelIds || [],
-      limit: payload.limit || env.schedulerSyncExistingLimit,
+      limit: payload.limit || findnovelConfig.scheduler.syncExistingLimit,
       syncExistingConcurrency:
-        payload.syncExistingConcurrency || env.crawlConcurrencyChapter,
-      discoverStart: payload.discoverStart || env.schedulerDiscoverNewStart,
-      discoverEnd: payload.discoverEnd || env.schedulerDiscoverNewEnd,
+        payload.syncExistingConcurrency ||
+        findnovelConfig.crawl.concurrencyChapter,
+      discoverStart:
+        payload.discoverStart || findnovelConfig.scheduler.discoverNewStart,
+      discoverEnd:
+        payload.discoverEnd || findnovelConfig.scheduler.discoverNewEnd,
       discoverCrawlChapters:
         payload.discoverCrawlChapters === undefined
-          ? env.schedulerDiscoverCrawlChapters
+          ? findnovelConfig.scheduler.discoverCrawlChapters
           : payload.discoverCrawlChapters,
       discoverConcurrency:
-        payload.discoverConcurrency || env.crawlConcurrencyNovel,
+        payload.discoverConcurrency || findnovelConfig.crawl.concurrencyNovel,
       runFixChapter:
         payload.runFixChapter === undefined
-          ? env.schedulerRunFixChapterOnMainSync
+          ? findnovelConfig.scheduler.runFixChapterOnMainSync
           : payload.runFixChapter,
       fixChapterWindowMinutes:
-        payload.fixChapterWindowMinutes || env.fixChapterWindowMinutes,
-      fixChapterLimit: payload.fixChapterLimit || env.fixChapterLimit
+        payload.fixChapterWindowMinutes ||
+        findnovelConfig.scheduler.fixChapterWindowMinutes,
+      fixChapterLimit:
+        payload.fixChapterLimit || findnovelConfig.scheduler.fixChapterLimit
     },
     { key: "scheduler:main-sync" }
   );
@@ -228,10 +246,31 @@ function enqueueFixChapter(payload = {}) {
   return schedulerQueue.enqueue(
     {
       jobType: "fix-chapter",
-      windowMinutes: payload.windowMinutes || env.fixChapterWindowMinutes,
-      limit: payload.limit || env.fixChapterLimit
+      windowMinutes:
+        payload.windowMinutes || findnovelConfig.scheduler.fixChapterWindowMinutes,
+      limit: payload.limit || findnovelConfig.scheduler.fixChapterLimit
     },
     { key: "scheduler:fix-chapter" }
+  );
+}
+
+function enqueueSuspectedAudit(payload = {}) {
+  if (!findnovelConfig.suspectedAudit.enabled) {
+    return {
+      accepted: false,
+      reason: "suspected_audit_disabled"
+    };
+  }
+
+  return schedulerQueue.enqueue(
+    {
+      jobType: "suspected-audit",
+      topLimit: payload.topLimit || findnovelConfig.suspectedAudit.topLimit,
+      minDelta: payload.minDelta || findnovelConfig.suspectedAudit.minDelta,
+      minRatio: payload.minRatio || findnovelConfig.suspectedAudit.minRatio,
+      concurrency: payload.concurrency || findnovelConfig.suspectedAudit.concurrency
+    },
+    { key: "scheduler:suspected-audit" }
   );
 }
 
@@ -251,6 +290,7 @@ module.exports = {
   enqueueLatestRelease,
   enqueueMainSync,
   enqueueNovelByUrl,
+  enqueueSuspectedAudit,
   enqueueSyncExisting,
   getQueueStats
 };

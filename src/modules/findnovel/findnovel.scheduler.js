@@ -1,6 +1,7 @@
 const schedule = require("node-schedule");
 
 const { env } = require("../../config/env");
+const { findnovelConfig } = require("../../config/findnovel");
 const logger = require("../../config/logger");
 const findnovelQueue = require("./findnovel.queue");
 
@@ -8,6 +9,7 @@ let latestReleaseJob = null;
 let mainSyncJob = null;
 let dailyMaintenanceJob = null;
 let fixChapterJob = null;
+let suspectedAuditJob = null;
 let schedulerStarted = false;
 
 function startFindnovelScheduler() {
@@ -21,12 +23,12 @@ function startFindnovelScheduler() {
   }
 
   latestReleaseJob = schedule.scheduleJob(
-    env.schedulerLatestReleaseCron,
+    findnovelConfig.scheduler.latestReleaseCron,
     () => {
       const enqueueResult = findnovelQueue.enqueueLatestRelease();
       logger.info(
         {
-          cron: env.schedulerLatestReleaseCron,
+          cron: findnovelConfig.scheduler.latestReleaseCron,
           enqueueResult
         },
         "Triggered latest-release scheduler"
@@ -35,12 +37,12 @@ function startFindnovelScheduler() {
   );
 
   mainSyncJob = schedule.scheduleJob(
-    env.schedulerMainCron,
+    findnovelConfig.scheduler.mainCron,
     () => {
       const enqueueResult = findnovelQueue.enqueueMainSync();
       logger.info(
         {
-          cron: env.schedulerMainCron,
+          cron: findnovelConfig.scheduler.mainCron,
           enqueueResult
         },
         "Triggered main-sync scheduler"
@@ -49,12 +51,12 @@ function startFindnovelScheduler() {
   );
 
   dailyMaintenanceJob = schedule.scheduleJob(
-    env.schedulerDailyMaintenanceCron,
+    findnovelConfig.scheduler.dailyMaintenanceCron,
     () => {
       const enqueueResult = findnovelQueue.enqueueDailyMaintenance();
       logger.info(
         {
-          cron: env.schedulerDailyMaintenanceCron,
+          cron: findnovelConfig.scheduler.dailyMaintenanceCron,
           enqueueResult
         },
         "Triggered daily-maintenance scheduler"
@@ -62,14 +64,14 @@ function startFindnovelScheduler() {
     }
   );
 
-  if (env.schedulerFixChapterEnabled) {
+  if (findnovelConfig.scheduler.fixChapterEnabled) {
     fixChapterJob = schedule.scheduleJob(
-      env.schedulerFixChapterCron,
+      findnovelConfig.scheduler.fixChapterCron,
       () => {
         const enqueueResult = findnovelQueue.enqueueFixChapter();
         logger.info(
           {
-            cron: env.schedulerFixChapterCron,
+            cron: findnovelConfig.scheduler.fixChapterCron,
             enqueueResult
           },
           "Triggered fix-chapter scheduler"
@@ -78,19 +80,45 @@ function startFindnovelScheduler() {
     );
   }
 
+  if (findnovelConfig.suspectedAudit.enabled) {
+    suspectedAuditJob = schedule.scheduleJob(
+      findnovelConfig.suspectedAudit.cron,
+      () => {
+        const enqueueResult = findnovelQueue.enqueueSuspectedAudit();
+        logger.info(
+          {
+            cron: findnovelConfig.suspectedAudit.cron,
+            enqueueResult
+          },
+          "Triggered suspected-audit scheduler"
+        );
+      }
+    );
+  }
+
   schedulerStarted = true;
   logger.info(
     {
-      latestReleaseCron: env.schedulerLatestReleaseCron,
-      mainSyncCron: env.schedulerMainCron,
-      dailyMaintenanceCron: env.schedulerDailyMaintenanceCron,
-      fixChapterEnabled: env.schedulerFixChapterEnabled,
-      fixChapterCron: env.schedulerFixChapterCron
+      latestReleaseCron: findnovelConfig.scheduler.latestReleaseCron,
+      mainSyncCron: findnovelConfig.scheduler.mainCron,
+      dailyMaintenanceCron: findnovelConfig.scheduler.dailyMaintenanceCron,
+      fixChapterEnabled: findnovelConfig.scheduler.fixChapterEnabled,
+      fixChapterCron: findnovelConfig.scheduler.fixChapterCron,
+      suspectedAuditEnabled: findnovelConfig.suspectedAudit.enabled,
+      suspectedAuditCron: findnovelConfig.suspectedAudit.cron
     },
     "Findnovel scheduler started"
   );
 
-  if (env.schedulerRunOnStartup) {
+  if (findnovelConfig.suspectedAudit.enabled && findnovelConfig.suspectedAudit.runOnStartup) {
+    const suspectedAuditEnqueue = findnovelQueue.enqueueSuspectedAudit();
+    logger.info(
+      { suspectedAuditEnqueue },
+      "Scheduler run-on-startup suspected-audit enqueued"
+    );
+  }
+
+  if (findnovelConfig.scheduler.runOnStartup) {
     const latestReleaseEnqueue = findnovelQueue.enqueueLatestRelease();
     const mainSyncEnqueue = findnovelQueue.enqueueMainSync();
     const dailyMaintenanceEnqueue = findnovelQueue.enqueueDailyMaintenance({
@@ -122,6 +150,11 @@ function stopFindnovelScheduler() {
   if (fixChapterJob) {
     fixChapterJob.cancel();
     fixChapterJob = null;
+  }
+
+  if (suspectedAuditJob) {
+    suspectedAuditJob.cancel();
+    suspectedAuditJob = null;
   }
 
   schedulerStarted = false;

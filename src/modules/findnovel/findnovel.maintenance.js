@@ -1,7 +1,62 @@
 const Chapter = require("../../models/chapterModel");
 const Novel = require("../../models/novelModel");
 const NovelView = require("../../models/novelViewModel");
+const cheerio = require("cheerio");
+const { findnovelConfig } = require("../../config/findnovel");
+const { fetchHtmlFromCrawler } = require("./findnovel.client");
+const { parseChapterInfo } = require("./chapter.parser");
 const repository = require("./findnovel.repository");
+const { sendSuspectedRows } = require("../notify/gsheet");
+
+const novelDramaChapterBaseUrl = "https://noveldrama.org/noveldrama";
+
+function buildNovelDramaChapterUrl({ novelId, chapterId }) {
+  if (!novelId || !chapterId) {
+    return null;
+  }
+
+  return `${novelDramaChapterBaseUrl}/${encodeURIComponent(
+    String(novelId)
+  )}/${encodeURIComponent(String(chapterId))}`;
+}
+
+function getTextLength(content) {
+  if (!content) {
+    return 0;
+  }
+
+  const $ = cheerio.load(`<div>${content}</div>`);
+  return $("div")
+    .text()
+    .replace(/\s+/g, " ")
+    .trim().length;
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, items.length || 1));
+
+  async function processOne() {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+
+      if (index >= items.length) {
+        return;
+      }
+
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (_error) {
+        results[index] = null;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => processOne()));
+  return results;
+}
 
 async function updateHotNew() {
   await Novel.updateMany({}, { hot: false, new: false });
@@ -165,7 +220,98 @@ async function fixRecentChapters({ windowMinutes = 30, limit = 200 } = {}) {
   };
 }
 
+async function auditSuspectedChapters({
+  topLimit = findnovelConfig.suspectedAudit.topLimit,
+  minDelta = findnovelConfig.suspectedAudit.minDelta,
+  minRatio = findnovelConfig.suspectedAudit.minRatio,
+  concurrency = findnovelConfig.suspectedAudit.concurrency
+} = {}) {
+  const novels = await Novel.find(
+    {},
+    {
+      novel_id: 1,
+      novel_name: 1,
+      viewWeek: 1
+    }
+  )
+    .sort({ viewWeek: -1 })
+    .limit(Number(topLimit))
+    .lean();
+
+  const rows = [];
+  const results = await runWithConcurrency(novels, concurrency, async (novel) => {
+    const localChapter = await Chapter.findOne(
+      { "novel.novel_id": novel.novel_id, premium_content: { $in: [null, false] } },
+      {
+        chapter_id: 1,
+        chapter_name: 1,
+        chapter_url: 1,
+        chapter_content: 1
+      }
+    )
+      .sort({ crawler_date: -1 })
+      .lean();
+
+    if (!localChapter || !localChapter.chapter_url || !localChapter.chapter_content) {
+      return null;
+    }
+
+    const html = await fetchHtmlFromCrawler(localChapter.chapter_url, 60000);
+    const sourceChapter = parseChapterInfo(html, localChapter.chapter_url);
+    if (!sourceChapter.success || !sourceChapter.chapter_content) {
+      return null;
+    }
+
+    const localLength = getTextLength(localChapter.chapter_content);
+    const sourceLength = getTextLength(sourceChapter.chapter_content);
+    if (!localLength || !sourceLength || sourceLength <= localLength) {
+      return null;
+    }
+
+    const delta = sourceLength - localLength;
+    const ratio = sourceLength / Math.max(1, localLength);
+    if (delta < Number(minDelta) || ratio < Number(minRatio)) {
+      return null;
+    }
+
+    const chapterUrl =
+      buildNovelDramaChapterUrl({
+        novelId: novel.novel_id,
+        chapterId: localChapter.chapter_id
+      }) || localChapter.chapter_url;
+
+    const description = `source longer: local=${localLength}, source=${sourceLength}, +${delta}, x${ratio.toFixed(
+      2
+    )}`;
+
+    return {
+      name: `${novel.novel_name || novel.novel_id} - ${localChapter.chapter_name}`,
+      url: chapterUrl,
+      description
+    };
+  });
+
+  for (const row of results) {
+    if (row) {
+      rows.push(row);
+    }
+  }
+
+  if (rows.length) {
+    await sendSuspectedRows(rows);
+  }
+
+  return {
+    totalNovels: novels.length,
+    suspectedCount: rows.length,
+    minDelta: Number(minDelta),
+    minRatio: Number(minRatio),
+    topLimit: Number(topLimit)
+  };
+}
+
 module.exports = {
+  auditSuspectedChapters,
   fixRecentChapters,
   updateHotNew,
   updateNovelViews

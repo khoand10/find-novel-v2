@@ -2,7 +2,7 @@ const slugModule = require("slug");
 const slug = slugModule.default || slugModule;
 
 const logger = require("../../config/logger");
-const { env } = require("../../config/env");
+const { findnovelConfig } = require("../../config/findnovel");
 const { fetchHtmlFromCrawler } = require("./findnovel.client");
 const {
   parseDiscoverPage,
@@ -12,9 +12,39 @@ const {
 const { parseChapterInfo } = require("./chapter.parser");
 const repository = require("./findnovel.repository");
 const { sendTelegramMessage } = require("../notify/telegram");
+const { sendChapterSuccessRow } = require("../notify/gsheet");
 
 const processedNovelIds = new Set();
 const processedNovelIds2 = new Set();
+const novelDramaChapterBaseUrl = "https://noveldrama.org/noveldrama";
+
+function buildNovelDramaChapterUrl({ novelId, chapterId }) {
+  if (!novelId || !chapterId) {
+    return null;
+  }
+
+  return `${novelDramaChapterBaseUrl}/${encodeURIComponent(
+    String(novelId)
+  )}/${encodeURIComponent(String(chapterId))}`;
+}
+
+function buildNewChapterTelegramMessage({
+  novelId,
+  novelName,
+  chapterId,
+  chapterName
+}) {
+  const chapterUrl = buildNovelDramaChapterUrl({ novelId, chapterId });
+  if (!chapterUrl) {
+    return null;
+  }
+
+  return [
+    "[FindNovel] Da cao thanh cong chapter moi",
+    `${novelName || novelId} - ${chapterName || chapterId}`,
+    chapterUrl
+  ].join("\n");
+}
 
 function normalizeFindnovelUrl(url) {
   if (!url || typeof url !== "string") {
@@ -28,7 +58,7 @@ function normalizeFindnovelUrl(url) {
 
   if (!/^https?:\/\//i.test(normalized)) {
     const prefix = normalized.startsWith("/") ? "" : "/";
-    normalized = `${env.findnovelBaseUrl}${prefix}${normalized}`;
+    normalized = `${findnovelConfig.baseUrl}${prefix}${normalized}`;
   }
 
   return normalized;
@@ -157,6 +187,30 @@ async function crawlChaptersForNovel(novel, options = {}) {
       if (chapterResult.created && chapterResult.doc) {
         await repository.updateNovelRecentChapter(novel.novel_id, chapterResult.doc);
         summary.created += 1;
+
+        const chapterSheetUrl =
+          buildNovelDramaChapterUrl({
+            novelId: chapterResult.doc.novel?.novel_id || novel.novel_id,
+            chapterId: chapterResult.doc.chapter_id
+          }) || chapterResult.doc.chapter_url || nextChapterUrl;
+
+        if (chapterSheetUrl) {
+          await sendChapterSuccessRow({
+            name: chapterResult.doc.chapter_name,
+            url: chapterSheetUrl
+          });
+        }
+
+        const chapterMessage = buildNewChapterTelegramMessage({
+          novelId: chapterResult.doc.novel?.novel_id || novel.novel_id,
+          novelName: chapterResult.doc.novel?.novel_name || novel.novel_name,
+          chapterId: chapterResult.doc.chapter_id,
+          chapterName: chapterResult.doc.chapter_name
+        });
+
+        if (chapterMessage) {
+          await sendTelegramMessage(chapterMessage);
+        }
       } else {
         summary.duplicated += 1;
       }
@@ -206,6 +260,16 @@ async function crawlNovelByUrl(novelUrl, options = {}) {
     novelName: novelPayload.novel_name,
     novelId: novelPayload.novel_id
   });
+
+  if (options.rejectIfExists && novelInDbByIdentity) {
+    const error = new Error(
+      `Novel already exists: ${novelInDbByIdentity.novel_name || novelInDbByIdentity.novel_id}`
+    );
+    error.code = "NOVEL_ALREADY_EXISTS";
+    error.statusCode = 409;
+    throw error;
+  }
+
   let novelInDb = novelInDbByIdentity;
   let created = false;
 
@@ -269,21 +333,34 @@ async function getLatestReleaseNovels(start = 1, end = 25) {
   const results = [];
 
   for (let page = start; page < end; page += 1) {
-    const pageUrl = `${env.findnovelBaseUrl}/latest-release-novels?page=${page}`;
+    const pageUrl = `${findnovelConfig.baseUrl}/latest-release-novels?page=${page}`;
     logger.info({ page, pageUrl }, "Fetching latest-release page");
 
-    const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
-    const pageItems = parseLatestReleasePage(htmlContent);
-    results.push(...pageItems);
+    try {
+      const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
+      const pageItems = parseLatestReleasePage(htmlContent);
+      results.push(...pageItems);
+    } catch (error) {
+      logger.warn(
+        {
+          page,
+          pageUrl,
+          error: error instanceof Error ? error.message : String(error)
+        },
+        "Skip latest-release page due to crawler fetch error"
+      );
+    }
   }
 
   return results;
 }
 
 async function syncLatestRelease(options = {}) {
-  const start = Number(options.start || env.schedulerLatestReleaseStart);
-  const end = Number(options.end || env.schedulerLatestReleaseEnd);
-  const concurrency = Number(options.concurrency || env.crawlConcurrencyCheck);
+  const start = Number(options.start || findnovelConfig.scheduler.latestReleaseStart);
+  const end = Number(options.end || findnovelConfig.scheduler.latestReleaseEnd);
+  const concurrency = Number(
+    options.concurrency || findnovelConfig.crawl.concurrencyCheck
+  );
 
   const latestNovels = await getLatestReleaseNovels(start, end);
   const tasks = await runWithConcurrency(latestNovels, concurrency, async (novelVictim) => {
@@ -344,17 +421,30 @@ async function syncLatestRelease(options = {}) {
 }
 
 async function discoverNewNovels(options = {}) {
-  const start = Number(options.start || env.schedulerDiscoverNewStart);
-  const end = Number(options.end || env.schedulerDiscoverNewEnd);
-  const concurrency = Number(options.concurrency || env.crawlConcurrencyNovel);
+  const start = Number(options.start || findnovelConfig.scheduler.discoverNewStart);
+  const end = Number(options.end || findnovelConfig.scheduler.discoverNewEnd);
+  const concurrency = Number(
+    options.concurrency || findnovelConfig.crawl.concurrencyNovel
+  );
 
   const novelUrls = [];
   for (let page = start; page < end; page += 1) {
-    const pageUrl = `${env.findnovelBaseUrl}/genre-all/sort-new/status-all/all-novel?page=${page}`;
+    const pageUrl = `${findnovelConfig.baseUrl}/genre-all/sort-new/status-all/all-novel?page=${page}`;
     logger.info({ page, pageUrl }, "Fetching discover-new page");
 
-    const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
-    novelUrls.push(...parseDiscoverPage(htmlContent));
+    try {
+      const htmlContent = await fetchHtmlFromCrawler(pageUrl, 20000);
+      novelUrls.push(...parseDiscoverPage(htmlContent));
+    } catch (error) {
+      logger.warn(
+        {
+          page,
+          pageUrl,
+          error: error instanceof Error ? error.message : String(error)
+        },
+        "Skip discover-new page due to crawler fetch error"
+      );
+    }
   }
 
   const uniqueUrls = [...new Set(novelUrls.map((url) => normalizeFindnovelUrl(url)).filter(Boolean))];
@@ -373,10 +463,12 @@ async function discoverNewNovels(options = {}) {
 async function syncExistingNovels(options = {}) {
   const novels = await repository.findNovelsForSync({
     novelIds: options.novelIds || [],
-    limit: Number(options.limit || env.schedulerSyncExistingLimit)
+    limit: Number(options.limit || findnovelConfig.scheduler.syncExistingLimit)
   });
 
-  const concurrency = Number(options.concurrency || env.crawlConcurrencyChapter);
+  const concurrency = Number(
+    options.concurrency || findnovelConfig.crawl.concurrencyChapter
+  );
   const tasks = await runWithConcurrency(novels, concurrency, async (novel) => {
     if (processedNovelIds.has(novel.novel_id)) {
       return {
