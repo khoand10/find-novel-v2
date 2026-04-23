@@ -278,6 +278,13 @@ async function crawlNovelByUrl(novelUrl, options = {}) {
       const upsertResult = await repository.upsertNovel(novelPayload);
       novelInDb = upsertResult.novel;
       created = upsertResult.created;
+
+      if (!novelInDb) {
+        novelInDb = await repository.findNovelByIdentity({
+          novelName: novelPayload.novel_name,
+          novelId: novelPayload.novel_id
+        });
+      }
     } catch (error) {
       if (!(error && error.code === 11000)) {
         throw error;
